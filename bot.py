@@ -8,6 +8,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import pymupdf
 import requests
 from dotenv import load_dotenv
 
@@ -43,12 +44,13 @@ TARGET_SUBJECTS = {
 LOOKAHEAD_DAYS = int(os.getenv("LOOKAHEAD_DAYS", "7"))
 CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "60"))
 
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+
 
 def load_jwt_token() -> str:
     if TOKEN_CACHE_FILE.exists():
         try:
             data = json.loads(TOKEN_CACHE_FILE.read_text(encoding="utf-8"))
-            # Если секрет на GitHub обновили вручную — берём новый секрет, а не старый кэш
             if data.get("env") == ENV_JWT_TOKEN and data.get("active"):
                 return data["active"].strip()
         except Exception:
@@ -93,7 +95,6 @@ def save_sent_hashes(hashes: set[str]) -> None:
 
 def build_session() -> requests.Session:
     session = requests.Session()
-    # Дневник всегда идёт напрямую, в обход системного прокси Windows
     session.trust_env = False
     session.headers.update(
         {
@@ -140,7 +141,7 @@ def tg_request(method: str, data: dict, files=None) -> dict:
         tg_sess.trust_env = False
         tg_sess.proxies = {"http": TG_PROXY, "https": TG_PROXY}
 
-    resp = tg_sess.post(url, data=data, files=files, timeout=40)
+    resp = tg_sess.post(url, data=data, files=files, timeout=60)
     result = resp.json()
     if not result.get("ok"):
         raise RuntimeError(f"Telegram API error ({method}): {result}")
@@ -211,6 +212,18 @@ def download_file(session: requests.Session, uuid: str) -> bytes:
     return resp.content
 
 
+def pdf_to_png_pages(pdf_bytes: bytes, dpi: int = 200) -> list[bytes]:
+    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    pages = []
+    try:
+        for page in doc:
+            pix = page.get_pixmap(dpi=dpi, alpha=False)
+            pages.append(pix.tobytes("png"))
+    finally:
+        doc.close()
+    return pages
+
+
 def make_homework_hash(
     dt: str, subject: str, texts: list[str], file_uuids: list[str]
 ) -> str:
@@ -248,7 +261,7 @@ def send_homework_to_tg(
         joined = "\n".join(texts)
         lines.append(f"<b>ДЗ:</b> {html.escape(joined)}")
     elif files:
-        lines.append("<b>ДЗ:</b> во вложении 👇")
+        lines.append("<b>ДЗ:</b> на фото 👇")
 
     message_text = "\n".join(lines)
 
@@ -256,41 +269,86 @@ def send_homework_to_tg(
     if TG_TOPIC_ID:
         base_payload["message_thread_id"] = TG_TOPIC_ID
 
-    if len(files) == 1 and len(message_text) <= 950:
-        f = files[0]
-        file_bytes = download_file(session, f["uuid"])
-        buf = io.BytesIO(file_bytes)
-        buf.name = f.get("file_name") or "homework.pdf"
-
-        tg_request(
-            "sendDocument",
-            data={
-                **base_payload,
-                "caption": message_text,
-                "parse_mode": "HTML",
-            },
-            files={"document": (buf.name, buf)},
-        )
-        return
-
-    tg_request(
-        "sendMessage",
-        data={
-            **base_payload,
-            "text": message_text,
-            "parse_mode": "HTML",
-        },
-    )
+    photo_items: list[tuple[str, bytes]] = []
+    other_files: list[tuple[str, bytes]] = []
 
     for f in files:
-        time.sleep(0.5)
+        file_name = f.get("file_name") or "file"
+        file_type = (f.get("file_type") or "").lower()
+        ext = Path(file_name).suffix.lower()
         file_bytes = download_file(session, f["uuid"])
-        buf = io.BytesIO(file_bytes)
-        buf.name = f.get("file_name") or "attachment"
+
+        if ext == ".pdf" or file_type == "application/pdf":
+            try:
+                pages = pdf_to_png_pages(file_bytes, dpi=200)
+                if pages:
+                    for idx, png_bytes in enumerate(pages, start=1):
+                        photo_items.append((f"{Path(file_name).stem}_p{idx}.png", png_bytes))
+                    continue
+            except Exception as err:
+                print(f"Не удалось отрендерить PDF {file_name}, отправляю файлом: {err}")
+            other_files.append((file_name, file_bytes))
+        elif ext in IMAGE_EXTENSIONS or file_type.startswith("image/"):
+            photo_items.append((file_name, file_bytes))
+        else:
+            other_files.append((file_name, file_bytes))
+
+    # Если фото нет или текст длиннее лимита подписи (1024) — шлём текст отдельно
+    caption_for_media = message_text if len(message_text) <= 950 else None
+    if not photo_items or caption_for_media is None:
+        tg_request(
+            "sendMessage",
+            data={
+                **base_payload,
+                "text": message_text,
+                "parse_mode": "HTML",
+            },
+        )
+
+    # Отправляем все фото вместе с подписью (альбомами до 10 штук)
+    for i in range(0, len(photo_items), 10):
+        chunk = photo_items[i : i + 10]
+        chunk_caption = caption_for_media if i == 0 else None
+
+        if len(chunk) == 1:
+            name, img_bytes = chunk[0]
+            payload = {**base_payload}
+            if chunk_caption:
+                payload["caption"] = chunk_caption
+                payload["parse_mode"] = "HTML"
+            tg_request(
+                "sendPhoto",
+                data=payload,
+                files={"photo": (name, io.BytesIO(img_bytes), "image/png")},
+            )
+        else:
+            media = []
+            files_payload = {}
+            for idx, (name, img_bytes) in enumerate(chunk):
+                attach_name = f"photo_{idx}"
+                item = {"type": "photo", "media": f"attach://{attach_name}"}
+                if idx == 0 and chunk_caption:
+                    item["caption"] = chunk_caption
+                    item["parse_mode"] = "HTML"
+                media.append(item)
+                files_payload[attach_name] = (name, io.BytesIO(img_bytes), "image/png")
+
+            tg_request(
+                "sendMediaGroup",
+                data={**base_payload, "media": json.dumps(media, ensure_ascii=False)},
+                files=files_payload,
+            )
+
+        if i + 10 < len(photo_items):
+            time.sleep(0.5)
+
+    # Некартиночные вложения (например .docx), если вдруг будут
+    for name, file_bytes in other_files:
+        time.sleep(0.5)
         tg_request(
             "sendDocument",
             data=base_payload,
-            files={"document": (buf.name, buf)},
+            files={"document": (name, io.BytesIO(file_bytes))},
         )
 
 
