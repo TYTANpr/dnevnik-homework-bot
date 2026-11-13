@@ -1,0 +1,46 @@
+name: Homework Bot
+
+on:
+  schedule:
+    # Время в UTC! Для Питера (UTC+3): 11,13,15,17,19 UTC = 14:00, 16:00, 18:00, 20:00, 22:00 МСК
+    - cron: "0 11,13,15,17,19 * * 1-6"
+  workflow_dispatch: # Кнопка ручного запуска во вкладке Actions для теста
+
+jobs:
+  check-homework:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore & save state (sent.json and token_cache.txt)
+        uses: actions/cache@v4
+        with:
+          path: |
+            sent.json
+            token_cache.txt
+          key: bot-state-${{ github.run_id }}
+          restore-keys: |
+            bot-state-
+
+      - name: Run homework bot
+        env:
+          TZ: Europe/Moscow
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          TG_TOPIC_ID: ${{ secrets.TG_TOPIC_ID }}
+          TG_ADMIN_ID: ${{ secrets.TG_ADMIN_ID }}
+          EDUCATION_ID: ${{ secrets.EDUCATION_ID }}
+          DNEVNIK_JWT_TOKEN: ${{ secrets.DNEVNIK_JWT_TOKEN }}
+          TARGET_SUBJECTS: "Алгебра,Геометрия,Вероятность и статистика"
+          LOOKAHEAD_DAYS: "7"
+        run: python bot.py
