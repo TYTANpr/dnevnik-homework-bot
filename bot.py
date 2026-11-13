@@ -253,33 +253,51 @@ def download_file(session: requests.Session, uuid: str) -> bytes:
     return resp.content
 
 
-def pdf_to_png_pages(pdf_bytes: bytes, dpi: int = 200) -> list[bytes]:
-    # 1. Быстрый и лёгкий путь через системный pdftoppm (для телефонов и Linux)
+def pdf_to_png_pages(pdf_bytes: bytes, dpi: int = 150) -> list[bytes]:
+    import shutil
+    import subprocess
+    import tempfile
+
+    # 1. mutool (mupdf-tools) — идеален для Android и Termux, не требует внешних шрифтов
+    if shutil.which("mutool"):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pdf_path = Path(tmpdir) / "doc.pdf"
+            pdf_path.write_bytes(pdf_bytes)
+            out_pattern = str(Path(tmpdir) / "page-%d.png")
+            res = subprocess.run(
+                ["mutool", "draw", "-o", out_pattern, "-r", str(dpi), str(pdf_path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if res.returncode == 0:
+                def get_page_num(p: Path) -> int:
+                    try:
+                        return int(p.stem.split("-")[-1])
+                    except ValueError:
+                        return 0
+
+                pages_files = sorted(Path(tmpdir).glob("page-*.png"), key=get_page_num)
+                pages = [p.read_bytes() for p in pages_files]
+                if pages:
+                    return pages
+
+    # 2. pdftoppm (poppler) — запасной вариант для обычного Linux
     if shutil.which("pdftoppm"):
         with tempfile.TemporaryDirectory() as tmpdir:
             pdf_path = Path(tmpdir) / "doc.pdf"
             pdf_path.write_bytes(pdf_bytes)
             out_prefix = Path(tmpdir) / "page"
-            subprocess.run(
-                [
-                    "pdftoppm",
-                    "-png",
-                    "-r",
-                    str(dpi),
-                    str(pdf_path),
-                    str(out_prefix),
-                ],
-                check=True,
+            res = subprocess.run(
+                ["pdftoppm", "-png", "-r", str(dpi), str(pdf_path), str(out_prefix)],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            pages = []
-            for p in sorted(Path(tmpdir).glob("page-*.png")):
-                pages.append(p.read_bytes())
-            if pages:
-                return pages
+            if res.returncode == 0:
+                pages = [p.read_bytes() for p in sorted(Path(tmpdir).glob("page-*.png"))]
+                if pages:
+                    return pages
 
-    # 2. Запасной путь через pymupdf (если он установлен, например на Windows)
+    # 3. pymupdf — запасной вариант для Windows
     if pymupdf is not None:
         doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
         pages = []
@@ -291,7 +309,7 @@ def pdf_to_png_pages(pdf_bytes: bytes, dpi: int = 200) -> list[bytes]:
             doc.close()
         return pages
 
-    raise RuntimeError("Не найдена утилита для конвертации PDF: установи poppler (pdftoppm)")
+    raise RuntimeError("Не найден конвертер PDF в картинки")
 
 
 def make_homework_hash(
