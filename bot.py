@@ -1,4 +1,5 @@
 import argparse
+import base64
 import hashlib
 import html
 import io
@@ -17,8 +18,8 @@ load_dotenv()
 BASE_URL = "https://dnevnik2.petersburgedu.ru"
 LESSONS_URL = f"{BASE_URL}/api/journal/lesson/list-by-education"
 FILE_DOWNLOAD_URL = f"{BASE_URL}/api/filekit/file/download"
+PROFILE_URL = f"{BASE_URL}/api/journal/person/related-child-list"
 
-# Храним состояние вне рабочей папки раннера, чтобы оно не стиралось
 STATE_DIR = Path.home() / ".dnevnik_bot"
 STATE_DIR.mkdir(exist_ok=True)
 SENT_FILE = STATE_DIR / "sent.json"
@@ -43,37 +44,59 @@ TARGET_SUBJECTS = {
 
 LOOKAHEAD_DAYS = int(os.getenv("LOOKAHEAD_DAYS", "7"))
 CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "60"))
-
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 
 
-def load_jwt_token() -> str:
+def extract_jwt_payload(token: str) -> dict:
+    """Извлекает полезную нагрузку из JWT (включая ключ esk/sso-key)."""
+    try:
+        parts = token.strip().split(".")
+        if len(parts) >= 2:
+            padding = "=" * ((4 - len(parts[1]) % 4) % 4)
+            raw = base64.urlsafe_b64decode(parts[1] + padding)
+            return json.loads(raw)
+    except Exception:
+        pass
+    return {}
+
+
+def load_active_tokens() -> tuple[str, str | None]:
+    """Загружает актуальный X-JWT-Token и sso-key."""
+    jwt_token = ENV_JWT_TOKEN
+    sso_key = None
+
     if TOKEN_CACHE_FILE.exists():
         try:
             data = json.loads(TOKEN_CACHE_FILE.read_text(encoding="utf-8"))
-            if data.get("env") == ENV_JWT_TOKEN and data.get("active"):
-                return data["active"].strip()
+            if data.get("env") == ENV_JWT_TOKEN and data.get("jwt"):
+                jwt_token = data["jwt"].strip()
+                sso_key = data.get("sso_key")
         except Exception:
             pass
-    return ENV_JWT_TOKEN
+
+    if not sso_key:
+        payload = extract_jwt_payload(jwt_token)
+        sso_key = payload.get("esk") or payload.get("sso-key")
+
+    return jwt_token, sso_key
 
 
-def save_jwt_token(token: str) -> None:
-    if token:
-        TOKEN_CACHE_FILE.write_text(
-            json.dumps(
-                {"env": ENV_JWT_TOKEN, "active": token.strip()},
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
+def save_active_tokens(jwt_token: str, sso_key: str | None = None) -> None:
+    if not jwt_token:
+        return
+    if not sso_key:
+        payload = extract_jwt_payload(jwt_token)
+        sso_key = payload.get("esk") or payload.get("sso-key")
 
-
-def get_cookie_jwt(session: requests.Session) -> str | None:
-    for c in session.cookies:
-        if c.name == "X-JWT-Token" and c.value:
-            return c.value
-    return None
+    data = {
+        "env": ENV_JWT_TOKEN,
+        "jwt": jwt_token.strip(),
+        "sso_key": sso_key.strip() if sso_key else None,
+        "updated_at": datetime.now().isoformat(),
+    }
+    TOKEN_CACHE_FILE.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
 
 def load_sent_hashes() -> set[str]:
@@ -106,30 +129,44 @@ def build_session() -> requests.Session:
             "Accept": "application/json, text/plain, */*",
             "Referer": f"{BASE_URL}/schedule",
             "X-Requested-With": "XMLHttpRequest",
+            "Connection": "close",
         }
     )
-    token = load_jwt_token()
-    if token:
-        session.cookies.set("X-JWT-Token", token, domain="dnevnik2.petersburgedu.ru")
+
+    jwt_token, sso_key = load_active_tokens()
+    if jwt_token:
+        session.cookies.set("X-JWT-Token", jwt_token, domain="dnevnik2.petersburgedu.ru")
+    if sso_key:
+        session.cookies.set("sso-key", sso_key, domain="dnevnik2.petersburgedu.ru")
+
     return session
 
 
-def request_with_token_refresh(
+def update_tokens_from_response(resp: requests.Response) -> None:
+    new_jwt = resp.cookies.get("X-JWT-Token")
+    new_sso = resp.cookies.get("sso-key")
+
+    if new_jwt or new_sso:
+        cur_jwt, cur_sso = load_active_tokens()
+        save_active_tokens(new_jwt or cur_jwt, new_sso or cur_sso)
+
+
+def api_request(
     session: requests.Session, url: str, params=None, stream: bool = False
 ) -> requests.Response:
-    old_token = get_cookie_jwt(session)
     resp = session.get(url, params=params, timeout=25, stream=stream)
+    update_tokens_from_response(resp)
 
+    # Если токен начал устаревать, сервер возвращает 401 со свежим Set-Cookie
     if resp.status_code == 401:
-        new_token = resp.cookies.get("X-JWT-Token") or get_cookie_jwt(session)
-        if new_token and new_token != old_token:
-            save_jwt_token(new_token)
+        new_jwt = resp.cookies.get("X-JWT-Token")
+        if new_jwt:
+            print("Обнаружен свежий X-JWT-Token от сервера, повторяю запрос...")
+            session.cookies.set("X-JWT-Token", new_jwt, domain="dnevnik2.petersburgedu.ru")
+            save_active_tokens(new_jwt)
             resp.close()
             resp = session.get(url, params=params, timeout=25, stream=stream)
-
-    latest_token = resp.cookies.get("X-JWT-Token") or get_cookie_jwt(session)
-    if latest_token and latest_token != old_token:
-        save_jwt_token(latest_token)
+            update_tokens_from_response(resp)
 
     return resp
 
@@ -175,11 +212,11 @@ def fetch_lessons(session: requests.Session) -> list[dict]:
             ("p_datetime_to", date_to),
             ("p_educations[]", EDUCATION_ID),
         ]
-        resp = request_with_token_refresh(session, LESSONS_URL, params=params)
+        resp = api_request(session, LESSONS_URL, params=params)
 
         if resp.status_code == 401:
             raise PermissionError(
-                "Ошибка 401: токен X-JWT-Token истёк. Обнови DNEVNIK_JWT_TOKEN в GitHub Secrets."
+                "Ошибка 401: сессия дневника истекла. Обнови DNEVNIK_JWT_TOKEN в GitHub Secrets."
             )
         resp.raise_for_status()
 
@@ -205,9 +242,7 @@ def fetch_lessons(session: requests.Session) -> list[dict]:
 
 
 def download_file(session: requests.Session, uuid: str) -> bytes:
-    resp = request_with_token_refresh(
-        session, FILE_DOWNLOAD_URL, params={"p_uuid": uuid}
-    )
+    resp = api_request(session, FILE_DOWNLOAD_URL, params={"p_uuid": uuid})
     resp.raise_for_status()
     return resp.content
 
@@ -293,7 +328,6 @@ def send_homework_to_tg(
         else:
             other_files.append((file_name, file_bytes))
 
-    # Если фото нет или текст длиннее лимита подписи (1024) — шлём текст отдельно
     caption_for_media = message_text if len(message_text) <= 950 else None
     if not photo_items or caption_for_media is None:
         tg_request(
@@ -305,7 +339,6 @@ def send_homework_to_tg(
             },
         )
 
-    # Отправляем все фото вместе с подписью (альбомами до 10 штук)
     for i in range(0, len(photo_items), 10):
         chunk = photo_items[i : i + 10]
         chunk_caption = caption_for_media if i == 0 else None
@@ -342,7 +375,6 @@ def send_homework_to_tg(
         if i + 10 < len(photo_items):
             time.sleep(0.5)
 
-    # Некартиночные вложения (например .docx), если вдруг будут
     for name, file_bytes in other_files:
         time.sleep(0.5)
         tg_request(
@@ -353,7 +385,8 @@ def send_homework_to_tg(
 
 
 def run_once() -> None:
-    if not TG_BOT_TOKEN or not TG_CHAT_ID or not EDUCATION_ID or not load_jwt_token():
+    jwt_token, _ = load_active_tokens()
+    if not TG_BOT_TOKEN or not TG_CHAT_ID or not EDUCATION_ID or not jwt_token:
         raise ValueError("Проверь переменные: не заполнены обязательные секреты!")
 
     session = build_session()
