@@ -17,13 +17,17 @@ BASE_URL = "https://dnevnik2.petersburgedu.ru"
 LESSONS_URL = f"{BASE_URL}/api/journal/lesson/list-by-education"
 FILE_DOWNLOAD_URL = f"{BASE_URL}/api/filekit/file/download"
 
-SENT_FILE = Path("sent.json")
-TOKEN_CACHE_FILE = Path("token_cache.txt")
+# Храним состояние вне рабочей папки раннера, чтобы оно не стиралось
+STATE_DIR = Path.home() / ".dnevnik_bot"
+STATE_DIR.mkdir(exist_ok=True)
+SENT_FILE = STATE_DIR / "sent.json"
+TOKEN_CACHE_FILE = STATE_DIR / "token_cache.json"
 
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
 TG_TOPIC_ID = os.getenv("TG_TOPIC_ID", "").strip()
 TG_ADMIN_ID = os.getenv("TG_ADMIN_ID", "").strip()
+TG_PROXY = os.getenv("TG_PROXY", "").strip()
 
 EDUCATION_ID = os.getenv("EDUCATION_ID", "").strip()
 ENV_JWT_TOKEN = os.getenv("DNEVNIK_JWT_TOKEN", "").strip()
@@ -42,15 +46,32 @@ CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "60"))
 
 def load_jwt_token() -> str:
     if TOKEN_CACHE_FILE.exists():
-        cached = TOKEN_CACHE_FILE.read_text(encoding="utf-8").strip()
-        if cached:
-            return cached
+        try:
+            data = json.loads(TOKEN_CACHE_FILE.read_text(encoding="utf-8"))
+            # Если секрет на GitHub обновили вручную — берём новый секрет, а не старый кэш
+            if data.get("env") == ENV_JWT_TOKEN and data.get("active"):
+                return data["active"].strip()
+        except Exception:
+            pass
     return ENV_JWT_TOKEN
 
 
 def save_jwt_token(token: str) -> None:
     if token:
-        TOKEN_CACHE_FILE.write_text(token.strip(), encoding="utf-8")
+        TOKEN_CACHE_FILE.write_text(
+            json.dumps(
+                {"env": ENV_JWT_TOKEN, "active": token.strip()},
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+
+def get_cookie_jwt(session: requests.Session) -> str | None:
+    for c in session.cookies:
+        if c.name == "X-JWT-Token" and c.value:
+            return c.value
+    return None
 
 
 def load_sent_hashes() -> set[str]:
@@ -64,7 +85,6 @@ def load_sent_hashes() -> set[str]:
 
 
 def save_sent_hashes(hashes: set[str]) -> None:
-    # Храним последние 1000 записей, чтобы файл не разрастался бесконечно
     recent = sorted(hashes)[-1000:]
     SENT_FILE.write_text(
         json.dumps(recent, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -73,6 +93,8 @@ def save_sent_hashes(hashes: set[str]) -> None:
 
 def build_session() -> requests.Session:
     session = requests.Session()
+    # Дневник всегда идёт напрямую, в обход системного прокси Windows
+    session.trust_env = False
     session.headers.update(
         {
             "User-Agent": (
@@ -94,19 +116,17 @@ def build_session() -> requests.Session:
 def request_with_token_refresh(
     session: requests.Session, url: str, params=None, stream: bool = False
 ) -> requests.Response:
-    old_token = session.cookies.get("X-JWT-Token")
+    old_token = get_cookie_jwt(session)
     resp = session.get(url, params=params, timeout=25, stream=stream)
 
-    # Портал может вернуть 401 со свежим Set-Cookie: X-JWT-Token — тогда повторяем запрос
     if resp.status_code == 401:
-        new_token = session.cookies.get("X-JWT-Token")
+        new_token = resp.cookies.get("X-JWT-Token") or get_cookie_jwt(session)
         if new_token and new_token != old_token:
             save_jwt_token(new_token)
             resp.close()
             resp = session.get(url, params=params, timeout=25, stream=stream)
 
-    # Если сервер обновил куку на обычном 200 ответе — сохраняем её
-    latest_token = session.cookies.get("X-JWT-Token")
+    latest_token = resp.cookies.get("X-JWT-Token") or get_cookie_jwt(session)
     if latest_token and latest_token != old_token:
         save_jwt_token(latest_token)
 
@@ -115,7 +135,12 @@ def request_with_token_refresh(
 
 def tg_request(method: str, data: dict, files=None) -> dict:
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/{method}"
-    resp = requests.post(url, data=data, files=files, timeout=40)
+    tg_sess = requests.Session()
+    if TG_PROXY:
+        tg_sess.trust_env = False
+        tg_sess.proxies = {"http": TG_PROXY, "https": TG_PROXY}
+
+    resp = tg_sess.post(url, data=data, files=files, timeout=40)
     result = resp.json()
     if not result.get("ok"):
         raise RuntimeError(f"Telegram API error ({method}): {result}")
@@ -153,7 +178,7 @@ def fetch_lessons(session: requests.Session) -> list[dict]:
 
         if resp.status_code == 401:
             raise PermissionError(
-                "Ошибка 401: токен X-JWT-Token истёк. Обнови его в .env или token_cache.txt."
+                "Ошибка 401: токен X-JWT-Token истёк. Обнови DNEVNIK_JWT_TOKEN в GitHub Secrets."
             )
         resp.raise_for_status()
 
@@ -166,7 +191,6 @@ def fetch_lessons(session: requests.Session) -> list[dict]:
 
         all_lessons.extend(items)
 
-        # Проверяем пагинацию, если сервер отдаёт мета-информацию
         meta = data.get("meta") or payload.get("meta") or {}
         if meta.get("last_page") and page >= int(meta["last_page"]):
             break
@@ -232,7 +256,6 @@ def send_homework_to_tg(
     if TG_TOPIC_ID:
         base_payload["message_thread_id"] = TG_TOPIC_ID
 
-    # Если файл ровно 1 и текст короткий — отправляем всё одним сообщением с файлом
     if len(files) == 1 and len(message_text) <= 950:
         f = files[0]
         file_bytes = download_file(session, f["uuid"])
@@ -250,7 +273,6 @@ def send_homework_to_tg(
         )
         return
 
-    # Иначе сначала текст, потом по очереди все файлы
     tg_request(
         "sendMessage",
         data={
@@ -274,7 +296,7 @@ def send_homework_to_tg(
 
 def run_once() -> None:
     if not TG_BOT_TOKEN or not TG_CHAT_ID or not EDUCATION_ID or not load_jwt_token():
-        raise ValueError("Проверь .env: не заполнены обязательные переменные!")
+        raise ValueError("Проверь переменные: не заполнены обязательные секреты!")
 
     session = build_session()
     sent_hashes = load_sent_hashes()
@@ -284,7 +306,7 @@ def run_once() -> None:
     except PermissionError as e:
         print(e)
         notify_admin(f"⚠️ <b>Бот ДЗ:</b> {html.escape(str(e))}")
-        return
+        raise
 
     new_count = 0
 
