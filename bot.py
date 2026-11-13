@@ -9,7 +9,13 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import pymupdf
+import shutil
+import subprocess
+import tempfile
+try:
+    import pymupdf
+except ImportError:
+    pymupdf = None
 import requests
 from dotenv import load_dotenv
 
