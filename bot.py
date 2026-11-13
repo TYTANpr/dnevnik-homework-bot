@@ -205,7 +205,7 @@ def notify_admin(text: str) -> None:
 
 def fetch_lessons(session: requests.Session) -> list[dict]:
     now = datetime.now()
-    date_from = (now - timedelta(days=1)).strftime("%d.%m.%Y 00:00:00")
+    date_from = (now - timedelta(days=4)).strftime("%d.%m.%Y 00:00:00")
     date_to = (now + timedelta(days=LOOKAHEAD_DAYS)).strftime("%d.%m.%Y 23:59:59")
 
     all_lessons = []
