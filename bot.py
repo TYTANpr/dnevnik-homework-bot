@@ -254,15 +254,44 @@ def download_file(session: requests.Session, uuid: str) -> bytes:
 
 
 def pdf_to_png_pages(pdf_bytes: bytes, dpi: int = 200) -> list[bytes]:
-    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-    pages = []
-    try:
-        for page in doc:
-            pix = page.get_pixmap(dpi=dpi, alpha=False)
-            pages.append(pix.tobytes("png"))
-    finally:
-        doc.close()
-    return pages
+    # 1. Быстрый и лёгкий путь через системный pdftoppm (для телефонов и Linux)
+    if shutil.which("pdftoppm"):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pdf_path = Path(tmpdir) / "doc.pdf"
+            pdf_path.write_bytes(pdf_bytes)
+            out_prefix = Path(tmpdir) / "page"
+            subprocess.run(
+                [
+                    "pdftoppm",
+                    "-png",
+                    "-r",
+                    str(dpi),
+                    str(pdf_path),
+                    str(out_prefix),
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            pages = []
+            for p in sorted(Path(tmpdir).glob("page-*.png")):
+                pages.append(p.read_bytes())
+            if pages:
+                return pages
+
+    # 2. Запасной путь через pymupdf (если он установлен, например на Windows)
+    if pymupdf is not None:
+        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+        pages = []
+        try:
+            for page in doc:
+                pix = page.get_pixmap(dpi=dpi, alpha=False)
+                pages.append(pix.tobytes("png"))
+        finally:
+            doc.close()
+        return pages
+
+    raise RuntimeError("Не найдена утилита для конвертации PDF: установи poppler (pdftoppm)")
 
 
 def make_homework_hash(
